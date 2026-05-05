@@ -1,9 +1,12 @@
 package transport
 
 import (
-	"TCUDP/internal/udp"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+
+	"TCUDP/internal/udp"
 )
 
 type Connection struct {
@@ -15,7 +18,7 @@ type Connection struct {
 }
 
 const (
-	MAX_RETRIES = 20
+	MAX_RETRIES = 5
 	TIMEOUT     = 1000
 )
 
@@ -47,45 +50,38 @@ func (c *Connection) Connect() error {
 
 	for attempts := 0; attempts < MAX_RETRIES; attempts++ {
 
-		// send SYN
+		// Send SYN
 		ComputeChecksumAndSet(syn)
 		data, _ := syn.encode()
 		c.udp.Send(data, c.peerAddr)
 
 		c.state = SYN_SENT
 
-		// wait for SYN-ACK
+		// Wait for SYN-ACK
 		c.udp.SetTimeout(TIMEOUT)
-
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			// timeout and retry
-			continue
+			continue // timeout, retry
 		}
 
 		pkt, _ := decode(raw)
-
 		if !VerifyChecksum(*pkt) {
 			continue
 		}
 
-		// validate SYNACK
-		if pkt.Flags&(SYN|ACK) == (SYN|ACK) &&
-			pkt.ACK == c.seq+1 {
-
+		if pkt.Flags&(SYN|ACK) == (SYN|ACK) && pkt.ACK == c.seq+1 {
 			c.ack = pkt.SEQ + 1
 			c.peerAddr = addr
 
 			// SYN consumed one seq number
 			c.seq++
 
-			// 4. Send final ACK
+			// Send final ACK
 			ackPkt := &Packet{
 				SEQ:   c.seq,
 				ACK:   c.ack,
 				Flags: ACK,
 			}
-
 			ComputeChecksumAndSet(ackPkt)
 			data, _ = ackPkt.encode()
 			c.udp.Send(data, c.peerAddr)
@@ -102,11 +98,11 @@ func (c *Connection) Connect() error {
 func (c *Connection) Listen() (*Connection, error) {
 	for attempts := 0; attempts < MAX_RETRIES; attempts++ {
 
-		// wait for SYN
+		// Wait for SYN
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			continue // timeout and retry
+			continue // timeout, retry
 		}
 
 		pkt, _ := decode(raw)
@@ -120,8 +116,8 @@ func (c *Connection) Listen() (*Connection, error) {
 
 		// Initialize connection from SYN
 		c.peerAddr = addr
-		c.seq = 0           // server initial seq number (can be random)
-		c.ack = pkt.SEQ + 1 // ACK client’s SYN
+		c.seq = 0
+		c.ack = pkt.SEQ + 1
 		c.state = SYN_RECEIVED
 
 		// Prepare SYN-ACK
@@ -131,9 +127,8 @@ func (c *Connection) Listen() (*Connection, error) {
 			Flags: SYN | ACK,
 		}
 
-		// send SYN-ACK and wait for the final ACK
+		// Send SYN-ACK and wait for final ACK
 		for retries := 0; retries < MAX_RETRIES; retries++ {
-
 			ComputeChecksumAndSet(synack)
 			data, _ := synack.encode()
 			c.udp.Send(data, c.peerAddr)
@@ -141,8 +136,7 @@ func (c *Connection) Listen() (*Connection, error) {
 			c.udp.SetTimeout(TIMEOUT)
 			raw2, addr2, err := c.udp.Receive()
 			if err != nil {
-				// timeout and retry SYN-ACK
-				continue
+				continue // timeout, retry SYN-ACK
 			}
 
 			pkt2, _ := decode(raw2)
@@ -150,43 +144,228 @@ func (c *Connection) Listen() (*Connection, error) {
 				continue
 			}
 
-			// Validate final ACK
 			if pkt2.Flags&ACK != 0 && pkt2.ACK == c.seq+1 {
 				c.peerAddr = addr2
 
-				// SYN consumed one seq number on both sides
+				// SYN consumed one seq number
 				c.seq++
 				c.ack = pkt2.SEQ
 
 				c.state = ESTABLISHED
 				return c, nil
 			}
-
-			// Ignore anything else and keep waiting/resending
 		}
-
-		// Failed to complete handshake for this SYN → go back to waiting for a new SYN
 	}
 
 	return nil, errors.New("connection timeout: SYN-ACK retries exceeded")
 }
 
 func (c *Connection) Send(data []byte) error {
-	// 1. Build packet
-	// 2. ComputeChecksumAndSet
-	// 3. Send & wait for ACK (stop-and-wait)
-	// 4. Retransmit on timeout
+	pkt := &Packet{
+		SEQ:  c.seq,
+		Data: data,
+	}
+
+	ComputeChecksumAndSet(pkt)
+	encoded, err := pkt.encode()
+	if err != nil {
+		return err
+	}
+
+	for {
+		c.udp.Send(encoded, c.peerAddr)
+
+		c.udp.SetTimeout(TIMEOUT)
+		raw, addr, err := c.udp.Receive()
+		if err != nil {
+			continue // timeout, retransmit
+		}
+
+		if addr != c.peerAddr {
+			continue
+		}
+
+		ackPkt, err := decode(raw)
+		if err != nil {
+			continue
+		}
+
+		if !VerifyChecksum(*ackPkt) {
+			continue
+		}
+
+		if ackPkt.ACK == c.seq+1 {
+			c.seq++
+			return nil
+		}
+
+		if ackPkt.ACK > c.seq+1 {
+			return fmt.Errorf("sequence desync: expected ACK %d, got %d", c.seq+1, ackPkt.ACK)
+		}
+
+		// ackPkt.ACK <= c.seq: old/duplicate ACK, retransmit
+	}
 }
 
 func (c *Connection) Receive() ([]byte, error) {
-	// 1. Read packet
-	// 2. VerifyChecksum
-	// 3. Send ACK back
-	// 4. Return data
+	for {
+		c.udp.SetTimeout(TIMEOUT)
+		raw, addr, err := c.udp.Receive()
+		if err != nil {
+			return nil, fmt.Errorf("receive error: %w", err)
+		}
+
+		if addr != c.peerAddr {
+			continue
+		}
+
+		pkt, err := decode(raw)
+		if err != nil || !VerifyChecksum(*pkt) {
+			continue
+		}
+
+		// Peer is closing — hand off to passive close handler
+		if pkt.Flags&FIN != 0 {
+			if err := c.acceptClose(pkt.SEQ); err != nil {
+				return nil, fmt.Errorf("close handshake failed: %w", err)
+			}
+			return nil, io.EOF // signal clean close to the caller
+		}
+
+		if pkt.SEQ != c.seq {
+			// Duplicate — re-ACK and discard
+			c.sendACK(pkt.SEQ + 1)
+			continue
+		}
+
+		if err := c.sendACK(c.seq + 1); err != nil {
+			return nil, fmt.Errorf("failed to send ACK: %w", err)
+		}
+		c.seq++
+		return pkt.Data, nil
+	}
 }
 
 func (c *Connection) Close() error {
-	// 1. Send FIN
-	// 2. Wait for ACK
-	// 3. Set state = StateClosed
+	if c.state == CLOSED {
+		return nil
+	}
+
+	// send FIN
+	fin := &Packet{SEQ: c.seq, Flags: FIN}
+	ComputeChecksumAndSet(fin)
+	encoded, err := fin.encode()
+	if err != nil {
+		return fmt.Errorf("failed to encode FIN: %w", err)
+	}
+
+	// wait for ACK of FIN
+	acked := false
+	for i := 0; i < MAX_RETRIES; i++ {
+		c.udp.Send(encoded, c.peerAddr)
+
+		c.udp.SetTimeout(TIMEOUT)
+		raw, addr, err := c.udp.Receive()
+		if err != nil {
+			continue // timeout, retransmit FIN
+		}
+		if addr != c.peerAddr {
+			continue
+		}
+
+		pkt, err := decode(raw)
+		if err != nil || !VerifyChecksum(*pkt) {
+			continue
+		}
+
+		if pkt.Flags&ACK != 0 && pkt.ACK == c.seq+1 {
+			acked = true
+			break
+		}
+	}
+
+	if !acked {
+		// Peer is gone
+		c.state = CLOSED
+		return nil
+	}
+
+	c.seq++
+
+	// wait for peer's FIN
+	for i := 0; i < MAX_RETRIES; i++ {
+		c.udp.SetTimeout(TIMEOUT)
+		raw, addr, err := c.udp.Receive()
+		if err != nil {
+			break
+		}
+		if addr != c.peerAddr {
+			continue
+		}
+
+		pkt, err := decode(raw)
+		if err != nil || !VerifyChecksum(*pkt) {
+			continue
+		}
+
+		if pkt.Flags&FIN != 0 {
+			// ACK the peer's FIN
+			c.sendACK(pkt.SEQ + 1)
+			break
+		}
+	}
+
+	c.state = CLOSED
+	return nil
+}
+
+func (c *Connection) acceptClose(finSEQ uint32) error {
+	// ACK their FIN
+	if err := c.sendACK(finSEQ + 1); err != nil {
+		return fmt.Errorf("failed to ACK FIN: %w", err)
+	}
+
+	// Send our own FIN
+	fin := &Packet{SEQ: c.seq, Flags: FIN}
+	ComputeChecksumAndSet(fin)
+	encoded, err := fin.encode()
+	if err != nil {
+		return fmt.Errorf("failed to encode FIN: %w", err)
+	}
+
+	for i := 0; i < MAX_RETRIES; i++ {
+		c.udp.Send(encoded, c.peerAddr)
+
+		c.udp.SetTimeout(TIMEOUT)
+		raw, addr, err := c.udp.Receive()
+		if err != nil {
+			continue // timeout, retransmit FIN
+		}
+		if addr != c.peerAddr {
+			continue
+		}
+
+		pkt, err := decode(raw)
+		if err != nil || !VerifyChecksum(*pkt) {
+			continue
+		}
+
+		if pkt.Flags&ACK != 0 && pkt.ACK == c.seq+1 {
+			c.seq++
+			break // FIN was acknowledged
+		}
+	}
+
+	c.state = CLOSED
+	return nil
+}
+
+func (c *Connection) sendACK(ack uint32) error {
+	pkt := &Packet{ACK: ack, Flags: ACK}
+	ComputeChecksumAndSet(pkt)
+	encoded, err := pkt.encode()
+	if err != nil {
+		return err
+	}
+	return c.udp.Send(encoded, c.peerAddr)
 }
