@@ -59,7 +59,7 @@ func (c *Connection) Connect() error {
 
 		ComputeChecksumAndSet(syn)
 		data, _ := syn.encode()
-		c.udp.Send(data, c.peerAddr)
+		c.networkSend(data, c.peerAddr)
 
 		c.state = SYN_SENT
 
@@ -90,7 +90,7 @@ func (c *Connection) Connect() error {
 
 			ComputeChecksumAndSet(ackPkt)
 			data, _ = ackPkt.encode()
-			c.udp.Send(data, addr)
+			c.networkSend(data, addr)
 
 			c.peerAddr = addr
 			c.state = ESTABLISHED
@@ -136,7 +136,7 @@ func (c *Connection) Listen() (*Connection, error) {
 
 			ComputeChecksumAndSet(synack)
 			data, _ := synack.encode()
-			c.udp.Send(data, c.peerAddr)
+			c.networkSend(data, c.peerAddr)
 
 			c.udp.SetTimeout(TIMEOUT)
 			raw2, addr2, err := c.udp.Receive()
@@ -186,7 +186,7 @@ func (c *Connection) Send(data []byte) error {
 	}
 
 	for {
-		c.udp.Send(encoded, c.peerAddr)
+		c.networkSend(encoded, c.peerAddr)
 
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
@@ -275,7 +275,7 @@ func (c *Connection) Close() error {
 	acked := false
 
 	for i := 0; i < MAX_RETRIES; i++ {
-		c.udp.Send(encoded, c.peerAddr)
+		c.networkSend(encoded, c.peerAddr)
 
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
@@ -345,7 +345,7 @@ func (c *Connection) acceptClose(finSEQ uint32) error {
 	}
 
 	for i := 0; i < MAX_RETRIES; i++ {
-		c.udp.Send(encoded, c.peerAddr)
+		c.networkSend(encoded, c.peerAddr)
 
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
@@ -384,5 +384,32 @@ func (c *Connection) sendACK(ack uint32) error {
 		return err
 	}
 
-	return c.udp.Send(encoded, c.peerAddr)
+	return c.networkSend(encoded, c.peerAddr)
+}
+
+// networkSend wraps the UDP send operation with simulated packet loss and corruption
+// to ensure the reliable transport logic handles these cases robustly.
+func (c *Connection) networkSend(data []byte, addr *net.UDPAddr) error {
+	if SimulateLoss() {
+		fmt.Printf("[Simulation] Dropping packet to %s\n", addr.String())
+		return nil
+	}
+
+	corrupted := SimulateCorruption(data)
+
+	// Check if data actually got mutated to log it
+	if len(corrupted) > 0 && len(data) > 0 {
+		isCorrupted := false
+		for i := 0; i < len(data); i++ {
+			if corrupted[i] != data[i] {
+				isCorrupted = true
+				break
+			}
+		}
+		if isCorrupted {
+			fmt.Printf("[Simulation] Corrupted packet to %s\n", addr.String())
+		}
+	}
+
+	return c.udp.Send(corrupted, addr)
 }
