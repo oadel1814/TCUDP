@@ -38,15 +38,18 @@ func (u *UDPConn) Receive() ([]byte, *net.UDPAddr, error) {
 	buf := make([]byte, 65507)
 	n, addr, err := u.conn.ReadFromUDP(buf)
 	if err != nil {
-		return nil, nil, errors.New("receive error!")
+		return nil, nil, err
 	}
-
 	return buf[:n], addr, nil
 }
 
 // Set a deadline for timeout support
 func (u *UDPConn) SetTimeout(d time.Duration) {
-	u.conn.SetReadDeadline(time.Now().Add(d))
+	if d == 0 {
+		u.conn.SetReadDeadline(time.Time{})
+	} else {
+		u.conn.SetReadDeadline(time.Now().Add(d * time.Millisecond))
+	}
 }
 
 // close the connection

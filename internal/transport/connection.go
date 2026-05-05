@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"TCUDP/internal/udp"
 )
@@ -19,7 +20,7 @@ type Connection struct {
 
 const (
 	MAX_RETRIES = 5
-	TIMEOUT     = 1000
+	TIMEOUT     = 1 * time.Second
 )
 
 type ConnectionState int
@@ -41,7 +42,13 @@ func NewConnection(udp *udp.UDPConn, peer *net.UDPAddr) *Connection {
 	}
 }
 
-// CLIENT side
+func sameAddr(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Port == b.Port && a.IP.Equal(b.IP)
+}
+
 func (c *Connection) Connect() error {
 	syn := &Packet{
 		SEQ:   c.seq,
@@ -50,42 +57,42 @@ func (c *Connection) Connect() error {
 
 	for attempts := 0; attempts < MAX_RETRIES; attempts++ {
 
-		// Send SYN
 		ComputeChecksumAndSet(syn)
 		data, _ := syn.encode()
 		c.udp.Send(data, c.peerAddr)
 
 		c.state = SYN_SENT
 
-		// Wait for SYN-ACK
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			continue // timeout, retry
+			continue
 		}
 
-		pkt, _ := decode(raw)
-		if !VerifyChecksum(*pkt) {
+		if !sameAddr(addr, c.peerAddr) {
+			continue
+		}
+
+		pkt, err := decode(raw)
+		if err != nil || !VerifyChecksum(*pkt) {
 			continue
 		}
 
 		if pkt.Flags&(SYN|ACK) == (SYN|ACK) && pkt.ACK == c.seq+1 {
 			c.ack = pkt.SEQ + 1
-			c.peerAddr = addr
+			c.seq++ // SYN consumed
 
-			// SYN consumed one seq number
-			c.seq++
-
-			// Send final ACK
 			ackPkt := &Packet{
 				SEQ:   c.seq,
 				ACK:   c.ack,
 				Flags: ACK,
 			}
+
 			ComputeChecksumAndSet(ackPkt)
 			data, _ = ackPkt.encode()
-			c.udp.Send(data, c.peerAddr)
+			c.udp.Send(data, addr)
 
+			c.peerAddr = addr
 			c.state = ESTABLISHED
 			return nil
 		}
@@ -94,19 +101,17 @@ func (c *Connection) Connect() error {
 	return errors.New("connection timeout: SYN retries exceeded")
 }
 
-// SERVER side
 func (c *Connection) Listen() (*Connection, error) {
-	for attempts := 0; attempts < MAX_RETRIES; attempts++ {
-
-		// Wait for SYN
+	for {
 		c.udp.SetTimeout(TIMEOUT)
+
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			continue // timeout, retry
+			continue
 		}
 
-		pkt, _ := decode(raw)
-		if !VerifyChecksum(*pkt) {
+		pkt, err := decode(raw)
+		if err != nil || !VerifyChecksum(*pkt) {
 			continue
 		}
 
@@ -114,21 +119,21 @@ func (c *Connection) Listen() (*Connection, error) {
 			continue
 		}
 
-		// Initialize connection from SYN
 		c.peerAddr = addr
 		c.seq = 0
 		c.ack = pkt.SEQ + 1
 		c.state = SYN_RECEIVED
 
-		// Prepare SYN-ACK
 		synack := &Packet{
 			SEQ:   c.seq,
 			ACK:   c.ack,
 			Flags: SYN | ACK,
 		}
 
-		// Send SYN-ACK and wait for final ACK
+		success := false
+
 		for retries := 0; retries < MAX_RETRIES; retries++ {
+
 			ComputeChecksumAndSet(synack)
 			data, _ := synack.encode()
 			c.udp.Send(data, c.peerAddr)
@@ -136,28 +141,36 @@ func (c *Connection) Listen() (*Connection, error) {
 			c.udp.SetTimeout(TIMEOUT)
 			raw2, addr2, err := c.udp.Receive()
 			if err != nil {
-				continue // timeout, retry SYN-ACK
-			}
-
-			pkt2, _ := decode(raw2)
-			if !VerifyChecksum(*pkt2) {
 				continue
 			}
 
-			if pkt2.Flags&ACK != 0 && pkt2.ACK == c.seq+1 {
-				c.peerAddr = addr2
+			if !sameAddr(addr2, c.peerAddr) {
+				continue
+			}
 
-				// SYN consumed one seq number
+			pkt2, err := decode(raw2)
+			if err != nil || !VerifyChecksum(*pkt2) {
+				continue
+			}
+
+			if pkt2.Flags&ACK != 0 &&
+				pkt2.ACK == c.seq+1 &&
+				pkt2.SEQ == c.ack {
+
 				c.seq++
-				c.ack = pkt2.SEQ
-
+				c.ack = pkt2.SEQ + 1
 				c.state = ESTABLISHED
-				return c, nil
+				success = true
+				break
 			}
 		}
-	}
 
-	return nil, errors.New("connection timeout: SYN-ACK retries exceeded")
+		if success {
+			return c, nil
+		}
+
+		c.state = CLOSED
+	}
 }
 
 func (c *Connection) Send(data []byte) error {
@@ -178,19 +191,15 @@ func (c *Connection) Send(data []byte) error {
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			continue // timeout, retransmit
+			continue
 		}
 
-		if addr != c.peerAddr {
+		if !sameAddr(addr, c.peerAddr) {
 			continue
 		}
 
 		ackPkt, err := decode(raw)
-		if err != nil {
-			continue
-		}
-
-		if !VerifyChecksum(*ackPkt) {
+		if err != nil || !VerifyChecksum(*ackPkt) {
 			continue
 		}
 
@@ -202,20 +211,19 @@ func (c *Connection) Send(data []byte) error {
 		if ackPkt.ACK > c.seq+1 {
 			return fmt.Errorf("sequence desync: expected ACK %d, got %d", c.seq+1, ackPkt.ACK)
 		}
-
-		// ackPkt.ACK <= c.seq: old/duplicate ACK, retransmit
 	}
 }
 
 func (c *Connection) Receive() ([]byte, error) {
 	for {
-		c.udp.SetTimeout(TIMEOUT)
+		c.udp.SetTimeout(0) // blocking
+
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
 			return nil, fmt.Errorf("receive error: %w", err)
 		}
 
-		if addr != c.peerAddr {
+		if !sameAddr(addr, c.peerAddr) {
 			continue
 		}
 
@@ -224,23 +232,29 @@ func (c *Connection) Receive() ([]byte, error) {
 			continue
 		}
 
-		// Peer is closing — hand off to passive close handler
 		if pkt.Flags&FIN != 0 {
 			if err := c.acceptClose(pkt.SEQ); err != nil {
-				return nil, fmt.Errorf("close handshake failed: %w", err)
+				return nil, err
 			}
-			return nil, io.EOF // signal clean close to the caller
+			return nil, io.EOF
 		}
 
-		if pkt.SEQ != c.seq {
-			// Duplicate — re-ACK and discard
-			c.sendACK(pkt.SEQ + 1)
+		// duplicate
+		if pkt.SEQ < c.seq {
+			c.sendACK(c.seq)
 			continue
 		}
 
-		if err := c.sendACK(c.seq + 1); err != nil {
-			return nil, fmt.Errorf("failed to send ACK: %w", err)
+		// out of order (not supported)
+		if pkt.SEQ > c.seq {
+			continue
 		}
+
+		// correct packet
+		if err := c.sendACK(c.seq + 1); err != nil {
+			return nil, err
+		}
+
 		c.seq++
 		return pkt.Data, nil
 	}
@@ -251,25 +265,25 @@ func (c *Connection) Close() error {
 		return nil
 	}
 
-	// send FIN
 	fin := &Packet{SEQ: c.seq, Flags: FIN}
 	ComputeChecksumAndSet(fin)
 	encoded, err := fin.encode()
 	if err != nil {
-		return fmt.Errorf("failed to encode FIN: %w", err)
+		return err
 	}
 
-	// wait for ACK of FIN
 	acked := false
+
 	for i := 0; i < MAX_RETRIES; i++ {
 		c.udp.Send(encoded, c.peerAddr)
 
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			continue // timeout, retransmit FIN
+			continue
 		}
-		if addr != c.peerAddr {
+
+		if !sameAddr(addr, c.peerAddr) {
 			continue
 		}
 
@@ -285,21 +299,21 @@ func (c *Connection) Close() error {
 	}
 
 	if !acked {
-		// Peer is gone
 		c.state = CLOSED
 		return nil
 	}
 
 	c.seq++
 
-	// wait for peer's FIN
+	// wait for FIN
 	for i := 0; i < MAX_RETRIES; i++ {
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
 			break
 		}
-		if addr != c.peerAddr {
+
+		if !sameAddr(addr, c.peerAddr) {
 			continue
 		}
 
@@ -309,7 +323,6 @@ func (c *Connection) Close() error {
 		}
 
 		if pkt.Flags&FIN != 0 {
-			// ACK the peer's FIN
 			c.sendACK(pkt.SEQ + 1)
 			break
 		}
@@ -320,17 +333,15 @@ func (c *Connection) Close() error {
 }
 
 func (c *Connection) acceptClose(finSEQ uint32) error {
-	// ACK their FIN
 	if err := c.sendACK(finSEQ + 1); err != nil {
-		return fmt.Errorf("failed to ACK FIN: %w", err)
+		return err
 	}
 
-	// Send our own FIN
 	fin := &Packet{SEQ: c.seq, Flags: FIN}
 	ComputeChecksumAndSet(fin)
 	encoded, err := fin.encode()
 	if err != nil {
-		return fmt.Errorf("failed to encode FIN: %w", err)
+		return err
 	}
 
 	for i := 0; i < MAX_RETRIES; i++ {
@@ -339,9 +350,10 @@ func (c *Connection) acceptClose(finSEQ uint32) error {
 		c.udp.SetTimeout(TIMEOUT)
 		raw, addr, err := c.udp.Receive()
 		if err != nil {
-			continue // timeout, retransmit FIN
+			continue
 		}
-		if addr != c.peerAddr {
+
+		if !sameAddr(addr, c.peerAddr) {
 			continue
 		}
 
@@ -352,7 +364,7 @@ func (c *Connection) acceptClose(finSEQ uint32) error {
 
 		if pkt.Flags&ACK != 0 && pkt.ACK == c.seq+1 {
 			c.seq++
-			break // FIN was acknowledged
+			break
 		}
 	}
 
@@ -361,11 +373,16 @@ func (c *Connection) acceptClose(finSEQ uint32) error {
 }
 
 func (c *Connection) sendACK(ack uint32) error {
-	pkt := &Packet{ACK: ack, Flags: ACK}
+	pkt := &Packet{
+		ACK:   ack,
+		Flags: ACK,
+	}
+
 	ComputeChecksumAndSet(pkt)
 	encoded, err := pkt.encode()
 	if err != nil {
 		return err
 	}
+
 	return c.udp.Send(encoded, c.peerAddr)
 }
