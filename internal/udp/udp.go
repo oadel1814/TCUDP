@@ -48,3 +48,8 @@ func (u *UDPConn) Receive() ([]byte, *net.UDPAddr, error) {
 func (u *UDPConn) SetTimeout(d time.Duration) {
 	u.conn.SetReadDeadline(time.Now().Add(d))
 }
+
+// close the connection
+func (u *UDPConn) Close() {
+	u.conn.Close()
+}
