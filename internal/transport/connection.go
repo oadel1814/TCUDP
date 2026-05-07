@@ -185,6 +185,7 @@ func (c *Connection) Send(data []byte) error {
 		return err
 	}
 
+	// stop and wait
 	for {
 		c.networkSend(encoded, c.peerAddr)
 
@@ -255,7 +256,7 @@ func (c *Connection) Receive() ([]byte, error) {
 			return nil, err
 		}
 
-		c.seq++
+		c.seq++ // consume
 		return pkt.Data, nil
 	}
 }

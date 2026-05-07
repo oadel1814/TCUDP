@@ -27,6 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
+
 	fmt.Println("Connected!")
 
 	client := http.NewClient(conn)
